@@ -1,2 +1,17 @@
-backend/__pycache__/
-*.pyc
+# Python virtual environment
+backend/.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
+# Local database
+backend/data/
