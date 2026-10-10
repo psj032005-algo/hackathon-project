@@ -2,12 +2,34 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import re
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+_PHONE_PATTERN = re.compile(r"^[+0-9() .-]{5,40}$")
+
+
+def _validate_optional_phone(value: str) -> str:
+    value = value.strip()
+    if value and not _PHONE_PATTERN.fullmatch(value):
+        raise ValueError("Phone number contains unsupported characters or is too short")
+    return value
+
+
+def _validate_optional_http_url(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    value = value.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Logo URL must be an absolute HTTP or HTTPS URL")
+    return value
 
 if __package__:
     from . import auth
@@ -51,6 +73,15 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=auth.PASSWORD_MINIMUM_LENGTH, max_length=auth.PASSWORD_MAXIMUM_LENGTH)
     store_name: str = Field(min_length=1, max_length=120)
     store_slug: str = Field(min_length=1, max_length=80)
+    business_type: str = Field(default="Other", min_length=1, max_length=60)
+    address_line1: str = Field(default="", max_length=200)
+    address_line2: str = Field(default="", max_length=200)
+    city: str = Field(default="", max_length=120)
+    region: str = Field(default="", max_length=120)
+    postal_code: str = Field(default="", max_length=32)
+    country: str = Field(default="", max_length=120)
+    contact_email: str = Field(default="", max_length=254)
+    contact_phone: str = Field(default="", max_length=40)
 
     @field_validator("email")
     @classmethod
@@ -75,6 +106,30 @@ class RegisterRequest(BaseModel):
     def normalize_store_slug(cls, value: str) -> str:
         return auth.validate_store_slug(value)
 
+    @field_validator("business_type", "address_line1", "address_line2", "city", "region", "postal_code", "country", "contact_phone")
+    @classmethod
+    def trim_profile_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("contact_email")
+    @classmethod
+    def normalize_contact_email(cls, value: str) -> str:
+        return auth.normalize_email(value) if value.strip() else ""
+
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_contact_phone(cls, value: str) -> str:
+        return _validate_optional_phone(value)
+
+    @model_validator(mode="after")
+    def validate_store_profile(self) -> RegisterRequest:
+        profile_fields = {"business_type", "address_line1", "address_line2", "city", "region", "postal_code", "country", "contact_email", "contact_phone"}
+        if profile_fields & self.model_fields_set:
+            required = ("business_type", "address_line1", "city", "region", "postal_code", "country")
+            if any(not getattr(self, field).strip() for field in required):
+                raise ValueError("Business type, street address, city, region, postal code, and country are required")
+        return self
+
 
 class LoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -95,6 +150,53 @@ class StoreUpdateRequest(BaseModel):
     description: str | None = Field(default=None, max_length=2000)
     logo_url: str | None = Field(default=None, max_length=2048)
     is_published: bool | None = None
+    business_type: str | None = Field(default=None, min_length=1, max_length=60)
+    address_line1: str | None = Field(default=None, max_length=200)
+    address_line2: str | None = Field(default=None, max_length=200)
+    city: str | None = Field(default=None, max_length=120)
+    region: str | None = Field(default=None, max_length=120)
+    postal_code: str | None = Field(default=None, max_length=32)
+    country: str | None = Field(default=None, max_length=120)
+    contact_email: str | None = Field(default=None, max_length=254)
+    contact_phone: str | None = Field(default=None, max_length=40)
+
+    @field_validator("logo_url")
+    @classmethod
+    def validate_logo_url(cls, value: str | None) -> str | None:
+        return _validate_optional_http_url(value)
+
+    @field_validator("business_type", "address_line1", "address_line2", "city", "region", "postal_code", "country", "contact_phone")
+    @classmethod
+    def trim_profile_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @field_validator("contact_email")
+    @classmethod
+    def normalize_contact_email(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return ""
+        return auth.normalize_email(value)
+
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_contact_phone(cls, value: str | None) -> str | None:
+        return _validate_optional_phone(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_business_type(self) -> StoreUpdateRequest:
+        if self.business_type is not None and not self.business_type.strip():
+            raise ValueError("Business type must not be empty")
+        return self
+
+
+class StaffInviteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_staff_email(cls, value: str) -> str:
+        return auth.normalize_email(value)
 
 
 @app.get("/api/health")
@@ -139,15 +241,27 @@ def register_owner(request: RegisterRequest):
             token = auth.create_access_token(user_id)
             connection.execute(
                 """
-                INSERT INTO stores (slug, name, description, owner_user_id, is_published)
-                VALUES (?, ?, '', ?, 0)
+                INSERT INTO stores (slug, name, description, owner_user_id, is_published,
+                    business_type, address_line1, address_line2, city, region, postal_code,
+                    country, contact_email, contact_phone)
+                VALUES (?, ?, '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (request.store_slug, request.store_name, user_id),
+                (request.store_slug, request.store_name, user_id, request.business_type,
+                 request.address_line1, request.address_line2, request.city, request.region,
+                 request.postal_code, request.country, request.contact_email, request.contact_phone),
             )
             new_store = connection.execute(
                 "SELECT id FROM stores WHERE slug = ? AND owner_user_id = ?",
                 (request.store_slug, user_id),
             ).fetchone()
+            connection.execute(
+                "INSERT INTO store_memberships (store_id, user_id, role) VALUES (?, ?, 'owner')",
+                (new_store["id"], user_id),
+            )
+            connection.execute(
+                "INSERT INTO store_onboarding (store_id, product_setup_method, is_complete) VALUES (?, NULL, 0)",
+                (new_store["id"],),
+            )
             for category in PREDEFINED_CATEGORIES:
                 connection.execute(
                     "INSERT OR IGNORE INTO categories (store_id, name, is_predefined) VALUES (?, ?, 1)",
@@ -156,6 +270,10 @@ def register_owner(request: RegisterRequest):
             connection.execute(
                 "INSERT OR IGNORE INTO store_customizations (store_id) VALUES (?)",
                 (new_store["id"],),
+            )
+            connection.execute(
+                "UPDATE store_customizations SET contact_email = ?, contact_phone = ? WHERE store_id = ?",
+                (request.contact_email, request.contact_phone, new_store["id"]),
             )
     except sqlite3.IntegrityError as error:
         raise HTTPException(status_code=409, detail="Email or store slug already exists") from error
@@ -246,8 +364,12 @@ def get_store_products(slug: str):
             """
             SELECT id, name, category, price, original_price, discount_percent, stock,
                    image_url, images_json, variants_json, description
-            FROM products
-            WHERE store_id = ?
+            FROM products AS p
+            WHERE p.store_id = ? AND EXISTS (
+                SELECT 1 FROM store_category_selections AS selected
+                JOIN categories AS c ON c.id = selected.category_id
+                WHERE selected.store_id = p.store_id AND c.name = p.category COLLATE NOCASE
+            )
             ORDER BY id
             """,
             (store["id"],),
@@ -267,10 +389,12 @@ def list_owned_stores(current_user: dict[str, Any] = Depends(auth.get_current_us
     with get_connection() as connection:
         stores = connection.execute(
             """
-            SELECT slug, name, description, logo_url, is_published
-            FROM stores
-            WHERE owner_user_id = ?
-            ORDER BY id
+            SELECT s.slug, s.name, s.description, s.logo_url, s.is_published, s.business_type,
+                   s.address_line1, s.address_line2, s.city, s.region, s.postal_code, s.country,
+                   s.contact_email, s.contact_phone, m.role
+            FROM stores AS s JOIN store_memberships AS m ON m.store_id = s.id
+            WHERE m.user_id = ?
+            ORDER BY s.id
             """,
             (current_user["id"],),
         ).fetchall()
@@ -282,7 +406,7 @@ def list_owned_stores(current_user: dict[str, Any] = Depends(auth.get_current_us
 
 @app.get("/api/owner/stores/{slug}")
 def get_owned_store(
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     return store
 
@@ -296,24 +420,43 @@ def update_owned_store(
     changes = request.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(status_code=422, detail="At least one store field is required")
-    for field in ("name", "description", "is_published"):
-        if field in changes and changes[field] is None:
+    for field, value in changes.items():
+        if value is None and field != "logo_url":
             raise HTTPException(status_code=422, detail=f"{field} cannot be null")
 
-    # Column names come only from this fixed allowlist; values remain parameterized.
-    assignments = ", ".join(f"{field} = ?" for field in changes)
-    values = list(changes.values()) + [store["id"], current_user["id"]]
+    # Column names come only from fixed request fields; values remain parameterized.
+    profile_changes = {field: changes.pop(field) for field in ("contact_email", "contact_phone") if field in changes}
     with get_connection() as connection:
-        cursor = connection.execute(
-            f"UPDATE stores SET {assignments} "
-            "WHERE id = ? AND owner_user_id = ?",
-            values,
-        )
-        if cursor.rowcount != 1:
+        if changes:
+            assignments = ", ".join(f"{field} = ?" for field in changes)
+            cursor = connection.execute(
+                f"UPDATE stores SET {assignments} WHERE id = ? AND owner_user_id = ?",
+                [*changes.values(), store["id"], current_user["id"]],
+            )
+        else:
+            cursor = connection.execute(
+                "SELECT 1 FROM stores WHERE id = ? AND owner_user_id = ?",
+                (store["id"], current_user["id"]),
+            )
+        if changes and cursor.rowcount != 1:
             raise HTTPException(status_code=404, detail="Store not found")
+        if not changes and cursor.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Store not found")
+        if profile_changes:
+            assignments = ", ".join(f"{field} = ?" for field in profile_changes)
+            connection.execute(
+                f"UPDATE stores SET {assignments} WHERE id = ? AND owner_user_id = ?",
+                [*profile_changes.values(), store["id"], current_user["id"]],
+            )
+            connection.execute(
+                f"UPDATE store_customizations SET {assignments} WHERE store_id = ?",
+                [*profile_changes.values(), store["id"]],
+            )
         updated = connection.execute(
             """
-            SELECT id, slug, name, description, logo_url, is_published
+            SELECT id, slug, name, description, logo_url, is_published, business_type,
+                   address_line1, address_line2, city, region, postal_code, country,
+                   contact_email, contact_phone
             FROM stores
             WHERE id = ? AND owner_user_id = ?
             """,
@@ -325,3 +468,60 @@ def update_owned_store(
     result = dict(updated)
     result["is_published"] = bool(result["is_published"])
     return result
+
+
+@app.get("/api/stores/{slug}/categories")
+def get_store_categories(slug: str):
+    with get_connection() as connection:
+        store = connection.execute(
+            "SELECT id FROM stores WHERE slug = ? AND is_published = 1", (slug,)
+        ).fetchone()
+        if store is None:
+            raise HTTPException(status_code=404, detail="Store not found")
+        rows = connection.execute(
+            """SELECT c.name FROM store_category_selections AS selected
+               JOIN categories AS c ON c.id = selected.category_id
+               WHERE selected.store_id = ? ORDER BY c.name COLLATE NOCASE""",
+            (store["id"],),
+        ).fetchall()
+    return [row["name"] for row in rows]
+
+
+@app.get("/api/owner/stores/{slug}/staff")
+def list_store_staff(store: dict[str, Any] = Depends(auth.require_store_owner)):
+    with get_connection() as connection:
+        rows = connection.execute(
+            """SELECT u.id, u.email, m.role, m.created_at FROM store_memberships AS m
+               JOIN users AS u ON u.id = m.user_id
+               WHERE m.store_id = ? AND m.role = 'staff' ORDER BY u.email""",
+            (store["id"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/owner/stores/{slug}/staff", status_code=status.HTTP_201_CREATED)
+def add_store_staff(request: StaffInviteRequest, store: dict[str, Any] = Depends(auth.require_store_owner)):
+    with get_connection() as connection:
+        user = connection.execute("SELECT id FROM users WHERE email = ?", (request.email,)).fetchone()
+        if user is None:
+            raise HTTPException(status_code=404, detail="Create an owner account for this email before adding staff")
+        try:
+            connection.execute(
+                "INSERT INTO store_memberships (store_id, user_id, role) VALUES (?, ?, 'staff')",
+                (store["id"], user["id"]),
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(status_code=409, detail="This user already has a role in the store") from error
+    return {"user_id": user["id"], "email": request.email, "role": "staff"}
+
+
+@app.delete("/api/owner/stores/{slug}/staff/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_store_staff(user_id: int, store: dict[str, Any] = Depends(auth.require_store_owner)):
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM store_memberships WHERE store_id = ? AND user_id = ? AND role = 'staff'",
+            (store["id"], user_id),
+        )
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Staff member not found")
+    return None

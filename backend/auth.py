@@ -179,7 +179,9 @@ def require_store_owner(
     with get_connection() as connection:
         store = connection.execute(
             """
-            SELECT id, slug, name, description, logo_url, is_published
+            SELECT id, slug, name, description, logo_url, is_published, business_type,
+                   address_line1, address_line2, city, region, postal_code, country,
+                   contact_email, contact_phone
             FROM stores
             WHERE slug = ? AND owner_user_id = ?
             """,
@@ -187,6 +189,28 @@ def require_store_owner(
         ).fetchone()
     if store is None:
         # Same response for a nonexistent store and another owner's store.
+        raise HTTPException(status_code=404, detail="Store not found")
+    result = dict(store)
+    result["is_published"] = bool(result["is_published"])
+    result["role"] = "owner"
+    return result
+
+
+def require_store_member(
+    slug: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Resolve an owner or staff membership for one private store."""
+    with get_connection() as connection:
+        store = connection.execute(
+            """SELECT s.id, s.slug, s.name, s.description, s.logo_url, s.is_published,
+                      s.business_type, s.address_line1, s.address_line2, s.city, s.region,
+                      s.postal_code, s.country, s.contact_email, s.contact_phone, m.role
+               FROM stores AS s JOIN store_memberships AS m ON m.store_id = s.id
+               WHERE s.slug = ? AND m.user_id = ?""",
+            (slug, current_user["id"]),
+        ).fetchone()
+    if store is None:
         raise HTTPException(status_code=404, detail="Store not found")
     result = dict(store)
     result["is_published"] = bool(result["is_published"])

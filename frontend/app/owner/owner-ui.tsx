@@ -6,7 +6,8 @@ export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.
 export function OwnerFrame({
   children,
   eyebrow = "STORE OWNER",
-}: PropsWithChildren<{ eyebrow?: string }>) {
+  adminNav = false,
+}: PropsWithChildren<{ eyebrow?: string; adminNav?: boolean }>) {
   return (
     <main className="min-h-screen bg-[#faf9f6] text-[#22251f]">
       <div className="bg-[#243c30] px-4 py-2.5 text-center text-xs font-medium tracking-wide text-white">
@@ -22,6 +23,7 @@ export function OwnerFrame({
           </Link>
         </div>
       </header>
+      {adminNav && <nav aria-label="Store admin" className="border-b border-black/5 bg-white/70"><div className="mx-auto flex max-w-6xl gap-2 overflow-x-auto px-5 py-3 text-sm sm:px-8"><Link className="shrink-0 rounded-full px-3 py-2 hover:bg-[#f4f3ed]" href="/owner/dashboard">Overview & settings</Link><Link className="shrink-0 rounded-full px-3 py-2 hover:bg-[#f4f3ed]" href="/owner/setup">Setup & categories</Link><Link className="shrink-0 rounded-full px-3 py-2 hover:bg-[#f4f3ed]" href="/owner/products">Products & imports</Link><Link className="shrink-0 rounded-full px-3 py-2 hover:bg-[#f4f3ed]" href="/owner/orders">Orders & analytics</Link></div></nav>}
       <section className="mx-auto w-full max-w-6xl px-5 py-10 sm:px-8 sm:py-14">
         <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#9b7753]">
           {eyebrow}
@@ -88,7 +90,16 @@ export async function responseError(response: Response): Promise<string> {
     const body = await response.json();
     if (typeof body.detail === "string") return body.detail;
     if (Array.isArray(body.detail)) {
-      return body.detail.map((item: { msg?: string }) => item.msg).filter(Boolean).join(" ");
+      const issues = body.detail as { loc?: unknown[]; msg?: string; type?: string }[];
+      const extraFields = [...new Set(issues
+        .filter((item) => item.type === "extra_forbidden")
+        .map((item) => item.loc?.at(-1))
+        .filter((field): field is string => typeof field === "string"))];
+      if (extraFields.length) {
+        const message = issues.find((item) => item.type === "extra_forbidden")?.msg || "Unexpected inputs are not permitted";
+        return `${message}: ${extraFields.join(", ")}.`;
+      }
+      return [...new Set(issues.map((item) => item.msg).filter((message): message is string => Boolean(message)))].join(" ");
     }
   } catch {
     // Fall through to a status-based message for non-JSON API responses.

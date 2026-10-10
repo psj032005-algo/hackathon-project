@@ -68,25 +68,59 @@ button:disabled {
   background-position: center;
 }
 
-.storefront-page[data-store-theme="botanical"] .storefront-card {
-  border-radius: 2rem;
+.storefront-page[data-store-theme="market"] .storefront-card {
+  border-radius: 1.5rem;
+  box-shadow: 0 8px 24px rgb(36 60 48 / 5%);
 }
 
-.storefront-page[data-store-theme="studio"] .storefront-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.storefront-page[data-store-theme="botanical"] .storefront-card {
+  border-radius: 2rem;
+  border-color: color-mix(in srgb, var(--store-accent) 34%, transparent);
+  box-shadow: 0 14px 34px rgb(49 91 67 / 9%);
+}
+
+.storefront-page[data-store-theme="botanical"] .storefront-card img {
+  aspect-ratio: 1 / 1;
+}
+
+.storefront-page[data-store-theme="studio"] .storefront-card {
+  border-radius: 0.35rem;
+  box-shadow: none;
+}
+
+.storefront-page[data-store-theme="studio"] .storefront-card img {
+  aspect-ratio: 1 / 1;
+}
+
+.storefront-page[data-store-theme="studio"] .storefront-card h3 {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .storefront-page[data-store-theme="midnight"] .storefront-card {
   border-radius: 0.75rem;
-  background: color-mix(in srgb, var(--store-surface) 75%, white);
+  color: #f6f4ee;
+  background: #263447;
+}
+
+.storefront-page[data-store-theme="midnight"] .storefront-card img {
+  aspect-ratio: 3 / 2;
 }
 
 @media (min-width: 1024px) {
+  .storefront-page[data-store-theme="market"] .storefront-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .storefront-page[data-store-theme="botanical"] .storefront-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .storefront-page[data-store-theme="studio"] .storefront-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .storefront-page[data-store-theme="midnight"] .storefront-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

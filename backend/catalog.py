@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import csv
+import base64
+import binascii
 import io
 import json
 import re
 import sqlite3
+import zipfile
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 if __package__:
@@ -24,6 +28,9 @@ else:
 router = APIRouter()
 MAX_CSV_BYTES = 1_000_000
 MAX_CSV_ROWS = 1000
+MAX_XLSX_BYTES = 1_000_000
+MAX_XLSX_EXPANDED_BYTES = 10_000_000
+MAX_XLSX_COLUMNS = 40
 CSV_FIELDS = {
     "name", "description", "category", "price", "original_price", "stock",
     "sku", "image_url", "discount_percent",
@@ -113,6 +120,42 @@ class CategoryCreate(BaseModel):
         return value.strip()
 
 
+class StoreSetupUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[str] = Field(max_length=20)
+    product_setup_method: Literal["demo", "spreadsheet"] | None = None
+
+    @field_validator("categories")
+    @classmethod
+    def normalize_selected_categories(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            category = value.strip()
+            if not category or len(category) > 50:
+                raise ValueError("Choose valid categories")
+            key = category.casefold()
+            if key not in seen:
+                normalized.append(category)
+                seen.add(key)
+        return normalized
+
+
+class SampleImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[str] = Field(min_length=1, max_length=20)
+
+    @field_validator("categories")
+    @classmethod
+    def normalize_categories(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(value.strip() for value in values))
+        if any(not value or len(value) > 50 for value in normalized):
+            raise ValueError("Choose valid categories")
+        return normalized
+
+
 class BulkChanges(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -141,6 +184,14 @@ class CSVImportRequest(BaseModel):
     # Permit multibyte text to reach the byte-limit check below while still
     # bounding the JSON field before it is decoded and parsed.
     csv_text: str = Field(min_length=1, max_length=MAX_CSV_BYTES * 2)
+    mapping: dict[str, str]
+    confirmed: bool = False
+
+
+class XLSXImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    xlsx_base64: str = Field(min_length=1, max_length=1_400_000)
     mapping: dict[str, str]
     confirmed: bool = False
 
@@ -214,13 +265,16 @@ def _theme_settings(row: sqlite3.Row | None) -> dict[str, Any]:
             "contact_email": "", "contact_phone": "", "shipping_policy": "", "returns_policy": "",
         }
     result = dict(row)
+    # Store identity is derived from the authenticated route, never sent back
+    # as a client-controlled customization field.
+    result.pop("store_id", None)
     result["homepage_sections"] = json.loads(result.pop("homepage_sections_json"))
     return result
 
 
 @router.get("/api/owner/stores/{slug}/categories")
 def list_categories(
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     with get_connection() as connection:
         rows = connection.execute(
@@ -230,10 +284,102 @@ def list_categories(
     return [{"name": row["name"], "is_predefined": bool(row["is_predefined"])} for row in rows]
 
 
+@router.get("/api/owner/stores/{slug}/setup")
+def get_store_setup(store: dict[str, Any] = Depends(auth.require_store_member)):
+    with get_connection() as connection:
+        selected = connection.execute(
+            """SELECT c.name FROM store_category_selections AS s
+               JOIN categories AS c ON c.id = s.category_id
+               WHERE s.store_id = ? ORDER BY c.name COLLATE NOCASE""",
+            (store["id"],),
+        ).fetchall()
+        setup = connection.execute(
+            "SELECT product_setup_method, is_complete FROM store_onboarding WHERE store_id = ?",
+            (store["id"],),
+        ).fetchone()
+    return {
+        "categories": [row["name"] for row in selected],
+        "product_setup_method": setup["product_setup_method"] if setup else None,
+        "is_complete": bool(setup["is_complete"]) if setup else True,
+    }
+
+
+@router.put("/api/owner/stores/{slug}/setup")
+def update_store_setup(
+    request: StoreSetupUpdate,
+    store: dict[str, Any] = Depends(auth.require_store_member),
+):
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        available: dict[str, tuple[int, str]] = {}
+        for row in connection.execute(
+            "SELECT id, name FROM categories WHERE store_id = ? ORDER BY id", (store["id"],)
+        ).fetchall():
+            available.setdefault(row["name"].casefold(), (row["id"], row["name"]))
+
+        selected_by_id: dict[int, str] = {}
+        for name in request.categories:
+            category = available.get(name.casefold())
+            if category is None:
+                raise HTTPException(status_code=422, detail="Choose categories belonging to this store")
+            # Keep the selection unique by database identity too. This protects
+            # the composite primary key if names differ only by case or an older
+            # client sends aliases that resolve to the same category row.
+            selected_by_id.setdefault(category[0], category[1])
+
+        connection.execute(
+            "DELETE FROM store_category_selections WHERE store_id = ?", (store["id"],)
+        )
+        connection.executemany(
+            "INSERT INTO store_category_selections (store_id, category_id) VALUES (?, ?)",
+            [(store["id"], category_id) for category_id in selected_by_id],
+        )
+        connection.execute(
+            """INSERT INTO store_onboarding (store_id, product_setup_method, is_complete)
+               VALUES (?, ?, 0)
+               ON CONFLICT(store_id) DO UPDATE SET
+                   product_setup_method = COALESCE(excluded.product_setup_method, store_onboarding.product_setup_method),
+                   is_complete = store_onboarding.is_complete""",
+            (store["id"], request.product_setup_method),
+        )
+    return {
+        "categories": list(selected_by_id.values()),
+        "product_setup_method": request.product_setup_method,
+        "is_complete": False,
+    }
+
+
+@router.post("/api/owner/stores/{slug}/setup/complete")
+def complete_store_setup(store: dict[str, Any] = Depends(auth.require_store_member)):
+    with get_connection() as connection:
+        setup = connection.execute(
+            "SELECT product_setup_method FROM store_onboarding WHERE store_id = ?",
+            (store["id"],),
+        ).fetchone()
+        count = connection.execute(
+            """SELECT COUNT(*) AS total FROM products AS p WHERE p.store_id = ? AND EXISTS (
+                   SELECT 1 FROM store_category_selections AS selected
+                   JOIN categories AS c ON c.id = selected.category_id
+                   WHERE selected.store_id = p.store_id AND c.name = p.category COLLATE NOCASE
+               )""",
+            (store["id"],),
+        ).fetchone()["total"]
+        category_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM store_category_selections WHERE store_id = ?",
+            (store["id"],),
+        ).fetchone()["total"]
+        if setup is None or setup["product_setup_method"] is None or category_count < 1 or count < 1:
+            raise HTTPException(status_code=409, detail="Select a category and add a product in that category to finish store setup")
+        connection.execute(
+            "UPDATE store_onboarding SET is_complete = 1 WHERE store_id = ?", (store["id"],)
+        )
+    return {"is_complete": True}
+
+
 @router.post("/api/owner/stores/{slug}/categories", status_code=status.HTTP_201_CREATED)
 def create_category(
     request: CategoryCreate,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     if not request.name:
         raise HTTPException(status_code=422, detail="Category name must not be empty")
@@ -254,13 +400,142 @@ def create_category(
     return {"name": request.name, "is_predefined": False}
 
 
+SAMPLE_PRODUCTS: dict[str, list[dict[str, Any]]] = {
+    "Accessories": [
+        {"name": "Canvas Weekend Tote", "description": "A sturdy cotton-canvas carryall with a roomy interior and reinforced handles.", "price": 1899, "stock": 16, "sku": "SAMPLE-ACC-001", "image": "https://images.unsplash.com/photo-1590874103328-eac38a683ce7?auto=format&fit=crop&w=900&q=85"},
+        {"name": "Everyday Brass Hoops", "description": "Lightweight brushed-brass hoops made for everyday wear.", "price": 1299, "stock": 22, "sku": "SAMPLE-ACC-002", "image": "https://images.unsplash.com/photo-1535632066927-ab7c9ab60908?auto=format&fit=crop&w=900&q=85"},
+    ],
+    "Home": [
+        {"name": "Speckled Stoneware Mug", "description": "A hand-finished stoneware mug with a comfortable curved handle.", "price": 899, "stock": 24, "sku": "SAMPLE-HOME-001", "image": "https://images.unsplash.com/photo-1514228742587-6b1558f89616?auto=format&fit=crop&w=900&q=85"},
+        {"name": "Natural Linen Cushion Cover", "description": "A soft, breathable linen cover with a hidden zip closure.", "price": 1499, "stock": 12, "sku": "SAMPLE-HOME-002", "image": "https://images.unsplash.com/photo-1584100936595-c0654b55a2e2?auto=format&fit=crop&w=900&q=85"},
+    ],
+    "Wellness": [
+        {"name": "Cedar & Sage Soy Candle", "description": "A small-batch soy candle with gentle cedarwood and sage notes.", "price": 1099, "stock": 14, "sku": "SAMPLE-WELL-001", "image": "https://images.unsplash.com/photo-1603006905003-be475563bc59?auto=format&fit=crop&w=900&q=85"},
+        {"name": "Botanical Bath Salts", "description": "Mineral-rich bath salts blended with dried calendula and lavender.", "price": 749, "stock": 18, "sku": "SAMPLE-WELL-002", "image": "https://images.unsplash.com/photo-1608248543803-ba4f8c70ae0b?auto=format&fit=crop&w=900&q=85"},
+    ],
+    "Clothing": [
+        {"name": "Relaxed Cotton Tee", "description": "A breathable midweight cotton tee with a relaxed everyday fit.", "price": 1599, "stock": 20, "sku": "SAMPLE-CLOTH-001", "image": "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?auto=format&fit=crop&w=900&q=85"},
+        {"name": "Linen Market Apron", "description": "A practical cross-back apron with two deep front pockets.", "price": 2199, "stock": 10, "sku": "SAMPLE-CLOTH-002", "image": "https://images.unsplash.com/photo-1543087903-1ac2ec7aa8c5?auto=format&fit=crop&w=900&q=85"},
+    ],
+    "Food": [
+        {"name": "Small-Batch Wildflower Honey", "description": "Golden local honey gathered from seasonal wildflower blooms.", "price": 599, "stock": 30, "sku": "SAMPLE-FOOD-001", "image": "https://images.unsplash.com/photo-1587049352851-8d4e89133924?auto=format&fit=crop&w=900&q=85"},
+        {"name": "Roasted Almond Granola", "description": "Crunchy oat granola with roasted almonds and a touch of maple.", "price": 449, "stock": 26, "sku": "SAMPLE-FOOD-002", "image": "https://images.unsplash.com/photo-1517093157656-b9eccef91cb1?auto=format&fit=crop&w=900&q=85"},
+    ],
+    "Other": [
+        {"name": "Handmade Paper Gift Set", "description": "A set of textured artisan paper goods for notes and small gifts.", "price": 699, "stock": 15, "sku": "SAMPLE-OTHER-001", "image": "https://images.unsplash.com/photo-1455390582262-044cdead277a?auto=format&fit=crop&w=900&q=85"},
+    ],
+}
+
+
+@router.post("/api/owner/stores/{slug}/products/import-samples/preview")
+def preview_sample_products(
+    request: SampleImportRequest,
+    store: dict[str, Any] = Depends(auth.require_store_member),
+):
+    products: list[dict[str, Any]] = []
+    with get_connection() as connection:
+        _validate_setup_sample_categories(connection, store["id"], request.categories)
+        for requested_category in request.categories:
+            category = _check_category(connection, store["id"], requested_category)
+            samples = SAMPLE_PRODUCTS.get(category)
+            if samples is None:
+                suffix = re.sub(r"[^A-Z0-9]+", "-", category.upper()).strip("-")[:16] or "CUSTOM"
+                samples = [{
+                    "name": f"Hand-finished {category} Gift Set",
+                    "description": f"A thoughtfully assembled sample item for the {category} collection.",
+                    "price": 1299, "stock": 12, "sku": f"SAMPLE-{suffix}-001",
+                    "image": "https://images.unsplash.com/photo-1455390582262-044cdead277a?auto=format&fit=crop&w=900&q=85",
+                }]
+            for sample in samples:
+                duplicate = connection.execute(
+                    "SELECT 1 FROM products WHERE store_id = ? AND (name = ? COLLATE NOCASE OR sku = ? COLLATE NOCASE)",
+                    (store["id"], sample["name"], sample["sku"]),
+                ).fetchone()
+                products.append({
+                    "name": sample["name"], "category": category,
+                    "description": sample["description"], "price": sample["price"],
+                    "stock": sample["stock"], "image_url": sample["image"],
+                    "already_exists": duplicate is not None,
+                })
+    return {
+        "total_products": len(products),
+        "importable_count": sum(not product["already_exists"] for product in products),
+        "skipped_count": sum(product["already_exists"] for product in products),
+        "products": products,
+    }
+
+
+@router.post("/api/owner/stores/{slug}/products/import-samples")
+def import_sample_products(
+    request: SampleImportRequest,
+    store: dict[str, Any] = Depends(auth.require_store_member),
+):
+    imported: list[str] = []
+    skipped: list[str] = []
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _validate_setup_sample_categories(connection, store["id"], request.categories)
+        for requested_category in request.categories:
+            category = _check_category(connection, store["id"], requested_category)
+            samples = SAMPLE_PRODUCTS.get(category)
+            if samples is None:
+                suffix = re.sub(r"[^A-Z0-9]+", "-", category.upper()).strip("-")[:16] or "CUSTOM"
+                samples = [{
+                    "name": f"Hand-finished {category} Gift Set",
+                    "description": f"A thoughtfully assembled sample item for the {category} collection.",
+                    "price": 1299, "stock": 12, "sku": f"SAMPLE-{suffix}-001",
+                    "image": "https://images.unsplash.com/photo-1455390582262-044cdead277a?auto=format&fit=crop&w=900&q=85",
+                }]
+            for sample in samples:
+                data = ProductWrite.model_validate({
+                    "name": sample["name"], "description": sample["description"],
+                    "category": category, "price": sample["price"], "stock": sample["stock"],
+                    "sku": sample["sku"], "images": [sample["image"]], "variants": [],
+                })
+                duplicate = connection.execute(
+                    "SELECT 1 FROM products WHERE store_id = ? AND (name = ? COLLATE NOCASE OR sku = ? COLLATE NOCASE)",
+                    (store["id"], data.name, data.sku),
+                ).fetchone()
+                if duplicate:
+                    skipped.append(data.name)
+                    continue
+                connection.execute(
+                    """INSERT INTO products
+                       (store_id, name, description, category, price, stock, sku, image_url, images_json, variants_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (store["id"], data.name, data.description, category, data.price, data.stock,
+                     data.sku, data.images[0], json.dumps(data.images), "[]"),
+                )
+                imported.append(data.name)
+    return {"imported_count": len(imported), "skipped_count": len(skipped), "imported": imported, "skipped": skipped}
+
+
+def _validate_setup_sample_categories(connection: sqlite3.Connection, store_id: int, requested: list[str]) -> None:
+    setup = connection.execute(
+        "SELECT product_setup_method, is_complete FROM store_onboarding WHERE store_id = ?",
+        (store_id,),
+    ).fetchone()
+    if setup is None or setup["is_complete"] or setup["product_setup_method"] != "demo":
+        return
+    selected = {
+        row["name"].casefold()
+        for row in connection.execute(
+            """SELECT c.name FROM store_category_selections AS selected
+               JOIN categories AS c ON c.id = selected.category_id WHERE selected.store_id = ?""",
+            (store_id,),
+        ).fetchall()
+    }
+    if any(name.casefold() not in selected for name in requested):
+        raise HTTPException(status_code=422, detail="Sample import categories must match the categories selected during setup")
+
+
 @router.get("/api/owner/stores/{slug}/products")
 def list_products(
     slug: str,
     search: str = Query(default="", max_length=160),
     category: str | None = Query(default=None, max_length=50),
     stock: Literal["all", "in_stock", "low_stock", "out_of_stock"] = "all",
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     if store["slug"] != slug:
         raise HTTPException(status_code=404, detail="Store not found")
@@ -273,25 +548,29 @@ def list_products(
     if category:
         clauses.append("category = ? COLLATE NOCASE")
         params.append(category)
-    if stock == "in_stock":
-        clauses.append("stock > 0")
-    elif stock == "low_stock":
-        clauses.append("stock BETWEEN 1 AND 5")
-    elif stock == "out_of_stock":
-        clauses.append("stock = 0")
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT id, name, description, category, price, original_price, discount_percent, stock, sku, image_url, images_json, variants_json "
             f"FROM products WHERE {' AND '.join(clauses)} ORDER BY id DESC",
             params,
         ).fetchall()
-    return [_product(row) for row in rows]
+    products = [_product(row) for row in rows]
+    if stock != "all":
+        def matches_stock(product: dict[str, Any]) -> bool:
+            quantities = [int(variant["stock"]) for variant in product["variants"]] if product["variants"] else [int(product["stock"])]
+            if stock == "in_stock":
+                return any(quantity > 0 for quantity in quantities)
+            if stock == "low_stock":
+                return any(1 <= quantity <= 5 for quantity in quantities)
+            return all(quantity == 0 for quantity in quantities)
+        products = [product for product in products if matches_stock(product)]
+    return products
 
 
 @router.post("/api/owner/stores/{slug}/products", status_code=status.HTTP_201_CREATED)
 def create_product(
     request: ProductWrite,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     try:
         with get_connection() as connection:
@@ -324,7 +603,7 @@ def create_product(
 def update_product(
     product_id: int,
     request: ProductWrite,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     try:
         with get_connection() as connection:
@@ -361,7 +640,7 @@ def update_product(
 @router.delete("/api/owner/stores/{slug}/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_product(
     product_id: int,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     with get_connection() as connection:
         cursor = connection.execute(
@@ -375,7 +654,7 @@ def delete_product(
 @router.patch("/api/owner/stores/{slug}/products/bulk")
 def bulk_update_products(
     request: BulkProductUpdate,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     product_ids = list(dict.fromkeys(request.product_ids))
     changes = request.changes.model_dump(exclude_unset=True)
@@ -404,11 +683,33 @@ def bulk_update_products(
                     status_code=422,
                     detail="Bulk price would make an existing original price invalid",
                 )
+        stock_value = changes.pop("stock", None)
         assignments = ", ".join(f"{field} = ?" for field in changes)
-        connection.execute(
-            f"UPDATE products SET {assignments} WHERE store_id = ? AND id IN ({placeholders})",
-            [*changes.values(), store["id"], *product_ids],
-        )
+        if assignments:
+            connection.execute(
+                f"UPDATE products SET {assignments} WHERE store_id = ? AND id IN ({placeholders})",
+                [*changes.values(), store["id"], *product_ids],
+            )
+        if stock_value is not None:
+            # The bulk stock control means “set available stock”; keep variant
+            # inventory in sync so owner filters and checkout agree afterward.
+            rows = connection.execute(
+                f"SELECT id, variants_json FROM products WHERE store_id = ? AND id IN ({placeholders})",
+                [store["id"], *product_ids],
+            ).fetchall()
+            for row in rows:
+                try:
+                    variants = json.loads(row["variants_json"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    variants = []
+                if isinstance(variants, list):
+                    for variant in variants:
+                        if isinstance(variant, dict):
+                            variant["stock"] = stock_value
+                connection.execute(
+                    "UPDATE products SET stock = ?, variants_json = ? WHERE id = ? AND store_id = ?",
+                    (stock_value, json.dumps(variants), row["id"], store["id"]),
+                )
     return {"updated_count": len(product_ids)}
 
 
@@ -455,6 +756,20 @@ def _preview_csv(connection: sqlite3.Connection, store_id: int, csv_text: str, m
     ).fetchall()
     existing_names = {row["normalized_name"] for row in existing}
     existing_skus = {row["normalized_sku"] for row in existing if row["normalized_sku"]}
+    onboarding = connection.execute(
+        "SELECT product_setup_method, is_complete FROM store_onboarding WHERE store_id = ?",
+        (store_id,),
+    ).fetchone()
+    selected_categories: set[str] = set()
+    if onboarding is not None and not onboarding["is_complete"] and onboarding["product_setup_method"] == "spreadsheet":
+        selected_categories = {
+            row["name"].casefold()
+            for row in connection.execute(
+                """SELECT c.name FROM store_category_selections AS selected
+                   JOIN categories AS c ON c.id = selected.category_id WHERE selected.store_id = ?""",
+                (store_id,),
+            ).fetchall()
+        }
     seen_names: dict[str, int] = {}
     seen_skus: dict[str, int] = {}
     preview_rows = []
@@ -509,6 +824,8 @@ def _preview_csv(connection: sqlite3.Connection, store_id: int, csv_text: str, m
                     _check_category(connection, store_id, product.category)
                 except HTTPException:
                     errors.append(f"Category '{product.category}' is not available for this store")
+                if selected_categories and product.category.casefold() not in selected_categories:
+                    errors.append(f"Category '{product.category}' was not selected during setup")
                 name_key = product.name.casefold()
                 sku_key = product.sku.casefold() if product.sku else ""
                 duplicate_of = None
@@ -533,10 +850,63 @@ def _preview_csv(connection: sqlite3.Connection, store_id: int, csv_text: str, m
     }
 
 
+def _xlsx_to_csv(encoded: str) -> str:
+    """Parse one bounded .xlsx sheet and reject formulas and malformed archives."""
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise HTTPException(status_code=422, detail="XLSX payload is not valid base64") from error
+    if not content or len(content) > MAX_XLSX_BYTES:
+        raise HTTPException(status_code=413, detail=f"XLSX file exceeds the {MAX_XLSX_BYTES}-byte limit")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > 100 or any(member.filename.startswith(("/", "\\")) or ".." in member.filename.split("/") for member in members):
+                raise HTTPException(status_code=422, detail="XLSX archive has an invalid structure")
+            expanded = sum(member.file_size for member in members)
+            if expanded > MAX_XLSX_EXPANDED_BYTES:
+                raise HTTPException(status_code=413, detail="XLSX expands beyond the allowed size")
+            if any(member.file_size > 100_000 and member.compress_size and member.file_size / member.compress_size > 100 for member in members):
+                raise HTTPException(status_code=422, detail="XLSX compression ratio is unsafe")
+            if "[Content_Types].xml" not in archive.namelist() or "xl/workbook.xml" not in archive.namelist():
+                raise HTTPException(status_code=422, detail="File is not a valid XLSX workbook")
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=False, keep_links=False)
+        worksheet = workbook.worksheets[0] if workbook.worksheets else None
+        if worksheet is None:
+            raise HTTPException(status_code=422, detail="XLSX workbook has no worksheets")
+        if (worksheet.max_row or 0) > MAX_CSV_ROWS + 1:
+            raise HTTPException(status_code=413, detail=f"XLSX exceeds the {MAX_CSV_ROWS}-row limit")
+        if (worksheet.max_column or 0) > MAX_XLSX_COLUMNS:
+            raise HTTPException(status_code=422, detail=f"XLSX may contain at most {MAX_XLSX_COLUMNS} columns")
+        csv_buffer = io.StringIO(newline="")
+        writer = csv.writer(csv_buffer)
+        row_count = 0
+        for row in worksheet.iter_rows():
+            if len(row) > MAX_XLSX_COLUMNS:
+                raise HTTPException(status_code=422, detail=f"XLSX may contain at most {MAX_XLSX_COLUMNS} columns")
+            if any(cell.data_type == "f" for cell in row):
+                raise HTTPException(status_code=422, detail="Formula cells are not accepted; replace formulas with reviewed values")
+            values = [cell.value for cell in row]
+            if not any(value is not None and str(value).strip() for value in values):
+                continue
+            row_count += 1
+            if row_count > MAX_CSV_ROWS + 1:
+                raise HTTPException(status_code=413, detail=f"XLSX exceeds the {MAX_CSV_ROWS}-row limit")
+            writer.writerow([value.isoformat() if hasattr(value, "isoformat") else "" if value is None else str(value) for value in values])
+        workbook.close()
+    except HTTPException:
+        raise
+    except (zipfile.BadZipFile, OSError, ValueError, KeyError, IndexError) as error:
+        raise HTTPException(status_code=422, detail="Malformed or unsupported XLSX workbook") from error
+    if not csv_buffer.getvalue():
+        raise HTTPException(status_code=422, detail="XLSX worksheet is empty")
+    return csv_buffer.getvalue()
+
+
 @router.post("/api/owner/stores/{slug}/products/import/preview")
 def preview_product_import(
     request: CSVImportRequest,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     with get_connection() as connection:
         return _preview_csv(connection, store["id"], request.csv_text, request.mapping)
@@ -545,7 +915,7 @@ def preview_product_import(
 @router.post("/api/owner/stores/{slug}/products/import")
 def import_products(
     request: CSVImportRequest,
-    store: dict[str, Any] = Depends(auth.require_store_owner),
+    store: dict[str, Any] = Depends(auth.require_store_member),
 ):
     if not request.confirmed:
         raise HTTPException(status_code=400, detail="Confirm the reviewed import before submitting")
@@ -572,6 +942,80 @@ def import_products(
     except sqlite3.IntegrityError as error:
         raise HTTPException(status_code=409, detail="A product name or SKU became duplicated during import") from error
     return {"imported_count": preview["total_rows"], "summary": "All reviewed products were imported."}
+
+
+@router.post("/api/owner/stores/{slug}/products/import-xlsx/preview")
+def preview_xlsx_import(
+    request: XLSXImportRequest,
+    store: dict[str, Any] = Depends(auth.require_store_member),
+):
+    csv_text = _xlsx_to_csv(request.xlsx_base64)
+    with get_connection() as connection:
+        return _preview_csv(connection, store["id"], csv_text, request.mapping)
+
+
+@router.get("/api/owner/stores/{slug}/products/import-xlsx/template")
+def download_xlsx_template(store: dict[str, Any] = Depends(auth.require_store_member)):
+    del store  # enforce store membership before returning the template
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Products"
+    sheet.append(["name", "description", "category", "price", "original_price", "stock", "sku", "image_url", "discount_percent"])
+    sheet.append(["Woven Basket", "Handwoven storage basket", "Home", 24.99, 29.99, 12, "BASKET-01", "https://example.com/basket.jpg", None])
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="store-products-template.xlsx"'},
+    )
+
+
+@router.post("/api/owner/stores/{slug}/products/import-xlsx/headers")
+def xlsx_import_headers(
+    request: XLSXImportRequest,
+    store: dict[str, Any] = Depends(auth.require_store_member),
+):
+    del store  # dependency enforces ownership before the workbook is parsed
+    try:
+        reader = csv.reader(io.StringIO(_xlsx_to_csv(request.xlsx_base64), newline=""), strict=True)
+        headers = [value.strip() for value in next(reader, [])]
+    except csv.Error as error:
+        raise HTTPException(status_code=422, detail="Malformed XLSX header row") from error
+    if not headers or any(not header for header in headers) or len(headers) != len(set(headers)):
+        raise HTTPException(status_code=422, detail="XLSX must have unique, non-empty column headers")
+    return {"headers": headers}
+
+
+@router.post("/api/owner/stores/{slug}/products/import-xlsx")
+def import_xlsx_products(
+    request: XLSXImportRequest,
+    store: dict[str, Any] = Depends(auth.require_store_member),
+):
+    if not request.confirmed:
+        raise HTTPException(status_code=400, detail="Confirm the reviewed import before submitting")
+    csv_text = _xlsx_to_csv(request.xlsx_base64)
+    try:
+        with get_connection() as connection:
+            preview = _preview_csv(connection, store["id"], csv_text, request.mapping)
+            if not preview["can_import"]:
+                raise HTTPException(status_code=422, detail={"message": "Fix all row errors before importing", "rows": preview["rows"]})
+            for item in preview["rows"]:
+                data = item["data"]
+                category = _check_category(connection, store["id"], data["category"])
+                connection.execute(
+                    """INSERT INTO products
+                       (store_id, name, description, category, price, original_price, discount_percent,
+                        stock, sku, image_url, images_json, variants_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (store["id"], data["name"], data["description"], category, data["price"],
+                     data["original_price"], data["discount_percent"], data["stock"], data["sku"],
+                     data["images"][0] if data["images"] else "", json.dumps(data["images"]), "[]"),
+                )
+    except sqlite3.IntegrityError as error:
+        raise HTTPException(status_code=409, detail="A product name or SKU became duplicated during import") from error
+    return {"imported_count": preview["total_rows"], "summary": "All reviewed spreadsheet rows were imported."}
 
 
 @router.get("/api/owner/stores/{slug}/customization")
@@ -605,6 +1049,13 @@ def update_customization(
         connection.execute(
             f"UPDATE store_customizations SET {assignments} WHERE store_id = ?", values
         )
+        public_contact = {field: changes[field] for field in ("contact_email", "contact_phone") if field in changes}
+        if public_contact:
+            public_assignments = ", ".join(f"{field} = ?" for field in public_contact)
+            connection.execute(
+                f"UPDATE stores SET {public_assignments} WHERE id = ?",
+                [*public_contact.values(), store["id"]],
+            )
         row = connection.execute(
             "SELECT * FROM store_customizations WHERE store_id = ?", (store["id"],)
         ).fetchone()

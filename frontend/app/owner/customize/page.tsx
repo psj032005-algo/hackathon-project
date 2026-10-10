@@ -1,6 +1,7 @@
 ﻿"use client";
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import type { CSSProperties } from "react";
 import { SessionExpiredError, useAuth } from "../../auth-provider";
 import { FormError, FormField, inputClassName, OwnerFrame, OwnerPanel, primaryButtonClassName, responseError } from "../owner-ui";
 
@@ -76,19 +77,33 @@ export default function OwnerCustomizePage() {
     if (!savedSettings || settingsSlug !== slug || !slug) return;
     setSaving(true); setError(""); setNotice("");
     try {
-      const response = await authorizedFetch("/api/owner/stores/" + encodeURIComponent(slug) + "/customization", { method: "PATCH", body: JSON.stringify(savedSettings) });
+      const payload = {
+        theme_id: savedSettings.theme_id,
+        primary_color: savedSettings.primary_color,
+        accent_color: savedSettings.accent_color,
+        background_color: savedSettings.background_color,
+        font_family: savedSettings.font_family,
+        banner_url: savedSettings.banner_url,
+        homepage_sections: savedSettings.homepage_sections,
+        footer_text: savedSettings.footer_text,
+        contact_email: savedSettings.contact_email,
+        contact_phone: savedSettings.contact_phone,
+        shipping_policy: savedSettings.shipping_policy,
+        returns_policy: savedSettings.returns_policy,
+      };
+      const response = await authorizedFetch("/api/owner/stores/" + encodeURIComponent(slug) + "/customization", { method: "PATCH", body: JSON.stringify(payload) });
       if (!response.ok) throw new Error(await responseError(response));
       setSettings(await response.json()); setNotice("Storefront customization saved.");
     } catch (caught) { if (!(caught instanceof SessionExpiredError)) setError(caught instanceof Error ? caught.message : "Could not save customization."); }
     finally { setSaving(false); }
   }
 
-  if (!ready || !token) return <OwnerFrame eyebrow="CUSTOMIZE"><p className="mt-8 text-center text-sm text-gray-500">Checking your sign-in...</p></OwnerFrame>;
+  if (!ready || !token) return <OwnerFrame eyebrow="CUSTOMIZE" adminNav><p className="mt-8 text-center text-sm text-gray-500">Checking your sign-in...</p></OwnerFrame>;
   const storeName = stores.find((item) => item.slug === slug)?.name || "Your Store";
   const settings = settingsSlug === slug ? savedSettings : null;
   const fontFamily = settings?.font_family === "serif" ? "Georgia, serif" : settings?.font_family === "mono" ? "monospace" : "Arial, sans-serif";
 
-  return <OwnerFrame eyebrow="STORE DESIGN">
+  return <OwnerFrame eyebrow="STORE DESIGN" adminNav>
     <div className="mt-5 flex flex-wrap items-end justify-between gap-4"><div><h1 className="text-4xl font-medium tracking-tight sm:text-5xl">Make it yours.</h1><p className="mt-3 text-sm text-gray-600">Choose a visual direction, then tune the details and preview your storefront.</p></div><div className="flex gap-3"><Link className="rounded-full border px-4 py-2 text-sm" href="/owner/dashboard">Dashboard</Link><Link className="rounded-full border px-4 py-2 text-sm" href="/owner/products">Products</Link></div></div>
     <div className="mt-6 max-w-md"><FormField label="Store"><select className={inputClassName} value={slug} onChange={(event) => setSlug(event.target.value)}>{stores.map((item) => <option key={item.slug} value={item.slug}>{item.name}</option>)}</select></FormField></div>
     {error && <div className="mt-4"><FormError message={error} /></div>}{notice && <p role="status" className="mt-4 rounded-xl bg-[#eef1e9] px-4 py-3 text-sm">{notice}</p>}
@@ -108,12 +123,12 @@ export default function OwnerCustomizePage() {
         <button className={primaryButtonClassName} onClick={() => void save()} disabled={saving}>{saving ? "Saving..." : "Save storefront design"}</button>
       </div>
       <OwnerPanel title="Live preview" description="Preview updates as you change settings. Saving updates this store's public appearance; unpublished stores stay hidden.">
-        <div className="overflow-hidden rounded-2xl border" style={{ color: "#22251f", backgroundColor: settings.background_color, fontFamily }}>
+        <div className="storefront-page overflow-hidden rounded-2xl border" data-store-theme={settings.theme_id} style={{ color: "#22251f", backgroundColor: settings.background_color, fontFamily, "--store-primary": settings.primary_color, "--store-accent": settings.accent_color, "--store-surface": settings.background_color } as CSSProperties}>
           <div className="px-4 py-2 text-center text-xs text-white" style={{ backgroundColor: settings.primary_color }}>{storeName}</div>
           <div className="flex items-center justify-between border-b px-4 py-4"><strong style={{ color: settings.primary_color, fontFamily }}>{storeName}</strong><span className="rounded-full px-4 py-2 text-xs text-white" style={{ backgroundColor: settings.primary_color }}>Shop now</span></div>
           {settings.homepage_sections.includes("hero") && <div className="p-5 sm:p-8" style={{ backgroundImage: settings.banner_url ? "linear-gradient(#0004,#0004),url(" + settings.banner_url + ")" : undefined, backgroundSize: "cover", backgroundPosition: "center", color: settings.banner_url ? "white" : undefined }}><p className="text-xs uppercase tracking-[0.2em]" style={{ color: settings.banner_url ? "white" : settings.accent_color }}>A LITTLE SOMETHING SPECIAL</p><h2 className="mt-3 text-3xl font-semibold">{storeName}</h2><p className="mt-2 text-sm">Thoughtful things, chosen with care.</p></div>}
           {settings.homepage_sections.includes("categories") && <div className="flex flex-wrap gap-2 px-4 py-3"><span className="rounded-full px-3 py-1 text-xs text-white" style={{ backgroundColor: settings.accent_color }}>Home</span><span className="rounded-full border px-3 py-1 text-xs">Accessories</span><span className="rounded-full border px-3 py-1 text-xs">Wellness</span></div>}
-          {settings.homepage_sections.includes("featured") && <div className={"grid gap-3 p-4 " + (settings.theme_id === "studio" ? "grid-cols-3" : settings.theme_id === "botanical" ? "grid-cols-2" : "grid-cols-2")}><div className="h-20 rounded-xl bg-black/10" /><div className="h-20 rounded-xl bg-black/10" /><div className="hidden h-20 rounded-xl bg-black/10 sm:block" /></div>}
+          {settings.homepage_sections.includes("featured") && <div className="storefront-grid grid grid-cols-2 gap-3 p-4"><div className="storefront-card h-20 rounded-xl bg-black/10" /><div className="storefront-card h-20 rounded-xl bg-black/10" /><div className="storefront-card hidden h-20 rounded-xl bg-black/10 sm:block" /></div>}
           {settings.homepage_sections.includes("newsletter") && <div className="mx-4 mb-4 rounded-xl p-4 text-sm text-white" style={{ backgroundColor: settings.primary_color }}>A note from {storeName}</div>}
           <div className="border-t px-4 py-3 text-xs" style={{ borderColor: settings.accent_color }}>{settings.footer_text || settings.contact_email || settings.contact_phone || "Footer and contact information"}</div>
         </div>

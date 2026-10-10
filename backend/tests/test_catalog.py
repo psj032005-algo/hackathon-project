@@ -1,5 +1,9 @@
+import base64
+import io
+
 import pytest
 from fastapi.testclient import TestClient
+from openpyxl import Workbook, load_workbook
 
 from main import app
 
@@ -70,6 +74,7 @@ def test_product_crud_filters_and_validation_are_store_scoped(client):
     assert client.get(url, headers=second_headers).status_code == 404
     assert client.get(url + "?search=BOWL-001", headers=first_headers).json()[0]["id"] == item["id"]
     assert client.get(url + "?category=Home&stock=in_stock", headers=first_headers).json()[0]["id"] == item["id"]
+    assert client.get(url + "?stock=low_stock", headers=first_headers).json()[0]["id"] == item["id"]
     assert client.get(url + "?stock=out_of_stock", headers=first_headers).json() == []
 
     assert client.put(
@@ -118,11 +123,120 @@ def test_categories_custom_categories_and_bulk_updates_are_tenant_scoped(client)
     )
     assert changed.status_code == 200
     assert changed.json()["updated_count"] == 1
-    assert client.get(product_url + "?stock=out_of_stock", headers=first_headers).json()[0]["category"] == "Garden"
+    updated = client.get(product_url + "?stock=out_of_stock", headers=first_headers).json()
+    assert updated[0]["category"] == "Garden"
+    assert updated[0]["variants"][0]["stock"] == 0
     assert client.patch(
         "/api/owner/stores/second-shop/products/bulk", headers=second_headers,
         json={"product_ids": [product["id"]], "changes": {"price": 1}},
     ).status_code == 404
+
+
+def test_sample_product_import_is_category_based_idempotent_and_tenant_scoped(client):
+    first_headers = owner(client, "sample-one@example.com", "sample-one")
+    second_headers = owner(client, "sample-two@example.com", "sample-two")
+    endpoint = "/api/owner/stores/sample-one/products/import-samples"
+    assert client.post(endpoint, json={"categories": ["Home"]}).status_code == 401
+    assert client.post(endpoint, headers=second_headers, json={"categories": ["Home"]}).status_code == 404
+    invalid = client.post(endpoint, headers=first_headers, json={"categories": ["Not This Store"]})
+    assert invalid.status_code == 422
+    result = client.post(endpoint, headers=first_headers, json={"categories": ["Home", "Wellness"]})
+    assert result.status_code == 200
+    assert result.json()["imported_count"] == 4
+    products = client.get("/api/owner/stores/sample-one/products", headers=first_headers).json()
+    assert {product["category"] for product in products} == {"Home", "Wellness"}
+    assert all(product["sku"].startswith("SAMPLE-") and product["images"] for product in products)
+    repeated = client.post(endpoint, headers=first_headers, json={"categories": ["Home", "Wellness"]})
+    assert repeated.status_code == 200
+    assert repeated.json()["imported_count"] == 0 and repeated.json()["skipped_count"] == 4
+    assert client.get("/api/owner/stores/sample-two/products", headers=second_headers).json() == []
+
+
+def test_store_setup_saves_selected_categories_previews_samples_and_completes(client):
+    first_headers = owner(client, "setup-one@example.com", "setup-one")
+    second_headers = owner(client, "setup-two@example.com", "setup-two")
+    setup_url = "/api/owner/stores/setup-one/setup"
+
+    # Mirror the setup page's initial authenticated requests before it renders
+    # Step 2. Both endpoints must work against a newly registered store.
+    stores = client.get("/api/owner/stores", headers=first_headers)
+    assert stores.status_code == 200
+    assert [store["slug"] for store in stores.json()] == ["setup-one"]
+    categories = client.get("/api/owner/stores/setup-one/categories", headers=first_headers)
+    assert categories.status_code == 200
+    assert {category["name"] for category in categories.json()} >= {"Home", "Clothing"}
+
+    initial = client.get(setup_url, headers=first_headers)
+    assert initial.status_code == 200
+    assert initial.json() == {"categories": [], "product_setup_method": None, "is_complete": False}
+    assert client.get(setup_url, headers=second_headers).status_code == 404
+
+    setup_payload = {
+        # Category matching is case-insensitive, so these aliases all resolve
+        # to one Home category row and must not be inserted more than once.
+        "categories": [" Home ", "home", "Clothing", "HOME"],
+        "product_setup_method": "demo",
+    }
+    saved = client.put(setup_url, headers=first_headers, json=setup_payload)
+    assert saved.status_code == 200
+    assert saved.json()["categories"] == ["Home", "Clothing"]
+    assert client.get(setup_url, headers=first_headers).json() == {
+        "categories": ["Clothing", "Home"], "product_setup_method": "demo", "is_complete": False,
+    }
+
+    # Retrying the same request replaces the existing rows atomically rather
+    # than colliding with the store/category composite primary key.
+    repeated = client.put(setup_url, headers=first_headers, json=setup_payload)
+    assert repeated.status_code == 200
+    assert client.get(setup_url, headers=first_headers).json()["categories"] == ["Clothing", "Home"]
+
+    # Owners can change their selections on a later submission.
+    changed = client.put(setup_url, headers=first_headers, json={
+        "categories": ["Wellness"], "product_setup_method": "spreadsheet",
+    })
+    assert changed.status_code == 200
+    assert client.get(setup_url, headers=first_headers).json() == {
+        "categories": ["Wellness"], "product_setup_method": "spreadsheet", "is_complete": False,
+    }
+    restored = client.put(setup_url, headers=first_headers, json=setup_payload)
+    assert restored.status_code == 200
+
+    invalid = client.put(setup_url, headers=first_headers, json={
+        "categories": ["Unknown"], "product_setup_method": "demo",
+    })
+    assert invalid.status_code == 422
+    # Validation failures must not erase resumable setup progress.
+    assert client.get(setup_url, headers=first_headers).json() == {
+        "categories": ["Clothing", "Home"], "product_setup_method": "demo", "is_complete": False,
+    }
+
+    preview = client.post(
+        "/api/owner/stores/setup-one/products/import-samples/preview",
+        headers=first_headers, json={"categories": ["Home"]},
+    )
+    assert preview.status_code == 200
+    assert preview.json()["total_products"] == 2
+    assert preview.json()["importable_count"] == 2
+    assert {row["category"] for row in preview.json()["products"]} == {"Home"}
+    not_selected = client.post(
+        "/api/owner/stores/setup-one/products/import-samples/preview",
+        headers=first_headers, json={"categories": ["Wellness"]},
+    )
+    assert not_selected.status_code == 422
+
+    assert client.post(setup_url + "/complete", headers=first_headers).status_code == 409
+    imported = client.post(
+        "/api/owner/stores/setup-one/products/import-samples",
+        headers=first_headers, json={"categories": ["Home"]},
+    )
+    assert imported.status_code == 200
+    assert client.post(setup_url + "/complete", headers=first_headers).json() == {"is_complete": True}
+    assert client.get(setup_url, headers=first_headers).json()["is_complete"] is True
+    assert client.patch("/api/owner/stores/setup-one", headers=first_headers, json={"is_published": True}).status_code == 200
+    assert client.get("/api/stores/setup-one/categories").json() == ["Clothing", "Home"]
+    public_products = client.get("/api/stores/setup-one/products").json()
+    assert len(public_products) == 2
+    assert {product["category"] for product in public_products} == {"Home"}
 
 
 def test_csv_preview_confirmation_row_errors_and_duplicates(client):
@@ -194,6 +308,57 @@ def test_csv_limits_malformed_files_and_import_tenant_isolation(client):
     ).status_code == 404
 
 
+def _xlsx_base64(rows):
+    output = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(row)
+    workbook.save(output)
+    workbook.close()
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def test_xlsx_preview_import_validation_formulas_limits_and_isolation(client):
+    first_headers = owner(client, "xlsx-one@example.com", "xlsx-one")
+    second_headers = owner(client, "xlsx-two@example.com", "xlsx-two")
+    base = "/api/owner/stores/xlsx-one/products/import-xlsx"
+    payload = _xlsx_base64([
+        ["Product Name", "Type", "Price", "On Hand", "SKU", "Photo"],
+        ["Spreadsheet Mug", "Home", 15.5, 4, "XLSX-1", "https://images.example.test/mug.jpg"],
+    ])
+    mapping = {"name": "Product Name", "category": "Type", "price": "Price", "stock": "On Hand", "sku": "SKU", "image_url": "Photo"}
+    assert client.post(base + "/headers", headers=first_headers, json={"xlsx_base64": payload, "mapping": {}}).json()["headers"] == ["Product Name", "Type", "Price", "On Hand", "SKU", "Photo"]
+    preview = client.post(base + "/preview", headers=first_headers, json={"xlsx_base64": payload, "mapping": mapping})
+    assert preview.status_code == 200 and preview.json()["can_import"] is True
+    not_confirmed = client.post(base, headers=first_headers, json={"xlsx_base64": payload, "mapping": mapping})
+    assert not_confirmed.status_code == 400
+    imported = client.post(base, headers=first_headers, json={"xlsx_base64": payload, "mapping": mapping, "confirmed": True})
+    assert imported.status_code == 200 and imported.json()["imported_count"] == 1
+    assert client.get("/api/owner/stores/xlsx-one/products", headers=first_headers).json()[0]["sku"] == "XLSX-1"
+
+    formula_payload = _xlsx_base64([["Name", "Category", "Price"], ["Formula", "Home", "=10+5"]])
+    formula_result = client.post(base + "/preview", headers=first_headers, json={
+        "xlsx_base64": formula_payload,
+        "mapping": {"name": "Name", "category": "Category", "price": "Price"},
+    })
+    assert formula_result.status_code == 422 and "Formula cells" in formula_result.json()["detail"]
+    assert client.post(base + "/preview", headers=first_headers, json={"xlsx_base64": "not-base64", "mapping": mapping}).status_code == 422
+    assert client.post(base + "/preview", headers=second_headers, json={"xlsx_base64": payload, "mapping": mapping}).status_code == 404
+    template = client.get(base + "/template", headers=first_headers)
+    assert template.status_code == 200
+    assert template.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    template_book = load_workbook(io.BytesIO(template.content), read_only=True, data_only=True)
+    assert list(template_book.active.values)[0] == ("name", "description", "category", "price", "original_price", "stock", "sku", "image_url", "discount_percent")
+    template_book.close()
+
+    too_many = _xlsx_base64([["Name", "Category", "Price"], *[[f"Item {index}", "Home", 5] for index in range(1001)]])
+    assert client.post(base + "/preview", headers=first_headers, json={
+        "xlsx_base64": too_many,
+        "mapping": {"name": "Name", "category": "Category", "price": "Price"},
+    }).status_code == 413
+
+
 def test_customization_is_validated_persistent_public_and_tenant_scoped(client):
     first_headers = owner(client, "theme-one@example.com", "theme-one")
     second_headers = owner(client, "theme-two@example.com", "theme-two")
@@ -202,10 +367,21 @@ def test_customization_is_validated_persistent_public_and_tenant_scoped(client):
 
     before = client.get(first_url, headers=first_headers)
     assert before.status_code == 200 and before.json()["theme_id"] == "market"
+    assert "store_id" not in before.json()
+    rejected_store_id = client.patch(first_url, headers=first_headers, json={
+        "theme_id": "studio", "store_id": 999999,
+    })
+    assert rejected_store_id.status_code == 422
+    assert any(
+        issue["type"] == "extra_forbidden" and issue["loc"][-1] == "store_id"
+        for issue in rejected_store_id.json()["detail"]
+    )
+    assert client.get(first_url, headers=first_headers).json()["theme_id"] == "market"
     changed = client.patch(
         first_url, headers=first_headers,
         json={
-            "theme_id": "botanical", "primary_color": "#345678", "font_family": "serif",
+            "theme_id": "botanical", "primary_color": "#345678", "accent_color": "#765432",
+            "background_color": "#fefefe", "font_family": "serif",
             "banner_url": "https://images.example.test/banner.jpg",
             "homepage_sections": ["hero", "categories"], "footer_text": "Made with care",
             "contact_email": "hello@example.test", "contact_phone": "+1 555 123 4567",
@@ -213,6 +389,9 @@ def test_customization_is_validated_persistent_public_and_tenant_scoped(client):
     )
     assert changed.status_code == 200
     assert client.get(first_url, headers=first_headers).json()["primary_color"] == "#345678"
+    saved = client.get(first_url, headers=first_headers).json()
+    assert saved["accent_color"] == "#765432" and saved["background_color"] == "#fefefe"
+    assert saved["font_family"] == "serif"
     assert client.get(second_url, headers=second_headers).json()["primary_color"] != "#345678"
     assert client.patch(first_url, headers=second_headers, json={"theme_id": "midnight"}).status_code == 404
     assert client.patch(first_url, headers=first_headers, json={"primary_color": "red"}).status_code == 422
@@ -227,3 +406,7 @@ def test_customization_is_validated_persistent_public_and_tenant_scoped(client):
     assert public.status_code == 200
     assert public.json()["customization"]["theme_id"] == "botanical"
     assert public.json()["customization"]["homepage_sections"] == ["hero", "categories"]
+    for theme in ("market", "botanical", "studio", "midnight"):
+        response = client.patch(first_url, headers=first_headers, json={"theme_id": theme})
+        assert response.status_code == 200 and response.json()["theme_id"] == theme
+        assert client.get("/api/stores/theme-one").json()["customization"]["theme_id"] == theme

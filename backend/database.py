@@ -271,6 +271,88 @@ def initialize_database() -> None:
             "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (3,)
         )
 
+        # Version 4 adds optional onboarding profile fields. Defaults preserve
+        # legacy stores and make this migration safe to rerun.
+        store_columns = _column_names(connection, "stores")
+        for column in ("business_type", "address_line1", "address_line2", "city", "region", "postal_code", "country", "contact_email", "contact_phone"):
+            if column not in store_columns:
+                declaration = "TEXT NOT NULL DEFAULT 'Other'" if column == "business_type" else "TEXT NOT NULL DEFAULT ''"
+                connection.execute(f"ALTER TABLE stores ADD COLUMN {column} {declaration}")
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (4,)
+        )
+
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS store_memberships (
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('owner', 'staff')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (store_id, user_id)
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_store_memberships_user ON store_memberships(user_id, store_id)"
+        )
+        # Backfill only ownership already recorded in stores. Legacy stores
+        # with a NULL owner (including the demo store) remain unassigned.
+        connection.execute(
+            """INSERT OR IGNORE INTO store_memberships (store_id, user_id, role)
+               SELECT id, owner_user_id, 'owner' FROM stores WHERE owner_user_id IS NOT NULL"""
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (5,)
+        )
+
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS notification_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_event_id INTEGER NOT NULL UNIQUE REFERENCES order_events(id) ON DELETE CASCADE,
+                order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'not_configured', 'sent', 'failed')),
+                attempted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                error_code TEXT
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_order ON notification_attempts(order_id, attempted_at DESC)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (6,)
+        )
+
+        # Version 7 records the category choices and completion state for the
+        # owner setup flow. Existing stores keep their current category behavior.
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS store_category_selections (
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+                PRIMARY KEY (store_id, category_id)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS store_onboarding (
+                store_id INTEGER PRIMARY KEY REFERENCES stores(id) ON DELETE CASCADE,
+                product_setup_method TEXT CHECK (product_setup_method IN ('demo', 'spreadsheet')),
+                is_complete INTEGER NOT NULL DEFAULT 1 CHECK (is_complete IN (0, 1))
+            )"""
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO store_category_selections (store_id, category_id)
+               SELECT c.store_id, c.id FROM categories AS c
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM store_onboarding AS o
+                   WHERE o.store_id = c.store_id AND o.is_complete = 0
+               )"""
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO store_onboarding (store_id, is_complete)
+               SELECT id, 1 FROM stores"""
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (7,)
+        )
+
         connection.execute(
             """
             INSERT OR IGNORE INTO stores (slug, name, description)
@@ -293,6 +375,15 @@ def initialize_database() -> None:
                 "INSERT OR IGNORE INTO categories (store_id, name, is_predefined) VALUES (?, ?, 1)",
                 (store["id"], category),
             )
+        connection.execute(
+            "INSERT OR IGNORE INTO store_onboarding (store_id, product_setup_method, is_complete) VALUES (?, NULL, 1)",
+            (store["id"],),
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO store_category_selections (store_id, category_id)
+               SELECT store_id, id FROM categories WHERE store_id = ?""",
+            (store["id"],),
+        )
         connection.execute(
             "INSERT OR IGNORE INTO store_customizations (store_id) VALUES (?)",
             (store["id"],),
