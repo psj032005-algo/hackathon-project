@@ -5,6 +5,8 @@
 
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 
 
@@ -28,13 +30,24 @@ type Product = {
 
 };
 
+type ApiProduct = {
+  id: number | string;
+  name: string;
+  category?: string | null;
+  price: number | string;
+  original_price?: number | string | null;
+  stock?: number | string | null;
+  image_url?: string | null;
+  description?: string | null;
+};
 
 
 
 
 
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8001";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8002";
 
 const STORE_SLUG = process.env.NEXT_PUBLIC_STORE_SLUG ?? "littlemarket-demo-2";
 
@@ -53,12 +66,14 @@ const money = (amount: number) =>
 
 
 export default function Home() {
+  const router = useRouter();
 
   const [search, setSearch] = useState("");
 
   const [category, setCategory] = useState("All");
 
   const [cart, setCart] = useState<Record<number, number>>({});
+  const [cartReady, setCartReady] = useState(false);
 
   const [cartOpen, setCartOpen] = useState(false);
 
@@ -104,13 +119,17 @@ useEffect(() => {
 
 
 
-      const data = await response.json();
+      const data: unknown = await response.json();
 
-      const items = Array.isArray(data) ? data : data.products ?? [];
+      const items: ApiProduct[] = Array.isArray(data)
+        ? data as ApiProduct[]
+        : typeof data === "object" && data !== null && "products" in data && Array.isArray(data.products)
+          ? data.products as ApiProduct[]
+          : [];
 
 
 
-      const mapped: Product[] = items.map((item: any) => ({
+      const mapped: Product[] = items.map((item) => ({
 
         id: Number(item.id),
 
@@ -163,6 +182,27 @@ useEffect(() => {
   };
 
 }, []);
+
+useEffect(() => {
+  const timer = window.setTimeout(() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(`store-cart:${STORE_SLUG}`) || "[]") as { product_id: number; quantity: number }[];
+      if (Array.isArray(saved)) {
+        setCart(Object.fromEntries(saved.filter((line) => Number.isInteger(line.product_id) && Number.isInteger(line.quantity) && line.quantity > 0 && line.quantity <= 100).map((line) => [line.product_id, line.quantity])));
+      }
+    } catch {
+      sessionStorage.removeItem(`store-cart:${STORE_SLUG}`);
+    }
+    setCartReady(true);
+  }, 0);
+  return () => window.clearTimeout(timer);
+}, []);
+
+useEffect(() => {
+  if (cartReady) {
+    sessionStorage.setItem(`store-cart:${STORE_SLUG}`, JSON.stringify(Object.entries(cart).map(([productId, quantity]) => ({ product_id: Number(productId), quantity }))));
+  }
+}, [cart, cartReady]);
 
 
 
@@ -304,6 +344,13 @@ useEffect(() => {
 
           </nav>
 
+
+          <Link
+            href="/owner/login"
+            className="whitespace-nowrap text-xs font-semibold text-[#243c30] hover:underline sm:text-sm"
+          >
+            Owner login
+          </Link>
 
 
           <button
@@ -765,7 +812,17 @@ useEffect(() => {
 
               <button
 
-                onClick={() => setNotice("Checkout will be connected when the backend order API is ready.")}
+                onClick={() => {
+                  try {
+                    sessionStorage.setItem(
+                      `store-cart:${STORE_SLUG}`,
+                      JSON.stringify(cartItems.map((product) => ({ product_id: product.id, quantity: cart[product.id] }))),
+                    );
+                    router.push(`/stores/${encodeURIComponent(STORE_SLUG)}/checkout`);
+                  } catch {
+                    setNotice("Could not save your bag in this browser session. Please try again.");
+                  }
+                }}
 
                 disabled={cartItems.length === 0}
 

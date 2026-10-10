@@ -1,2 +1,8 @@
 backend/__pycache__/
 *.pyc
+backend/*.db
+backend/*.db-*
+backend/*.sqlite
+backend/*.sqlite3
+backend/.pytest_cache/
+backend/.env

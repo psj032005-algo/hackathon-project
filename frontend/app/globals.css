@@ -44,3 +44,49 @@ button:disabled {
   background: #d9e2d5;
   color: #243c30;
 }
+
+.storefront-page {
+  color: var(--foreground);
+}
+
+.storefront-ribbon,
+.storefront-footer {
+  background: var(--store-primary);
+}
+
+.storefront-header {
+  background: color-mix(in srgb, var(--store-surface) 94%, transparent);
+}
+
+.storefront-primary {
+  background-color: var(--store-primary);
+}
+
+.storefront-hero {
+  background-color: color-mix(in srgb, var(--store-accent) 12%, var(--store-surface));
+  background-size: cover;
+  background-position: center;
+}
+
+.storefront-page[data-store-theme="botanical"] .storefront-card {
+  border-radius: 2rem;
+}
+
+.storefront-page[data-store-theme="studio"] .storefront-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.storefront-page[data-store-theme="midnight"] .storefront-card {
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--store-surface) 75%, white);
+}
+
+@media (min-width: 1024px) {
+  .storefront-page[data-store-theme="botanical"] .storefront-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .storefront-page[data-store-theme="studio"] .storefront-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
