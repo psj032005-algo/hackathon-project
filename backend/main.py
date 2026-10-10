@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Any
@@ -52,12 +53,22 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Hackathon Backend", version="1.0.0", lifespan=lifespan)
 
+
+def get_cors_allowed_origins() -> list[str]:
+    """Read explicit browser origins, defaulting to the local frontend."""
+    configured_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+    origins = [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+    if not origins:
+        return ["http://localhost:3000"]
+    if "*" in origins:
+        raise ValueError("CORS_ALLOWED_ORIGINS cannot contain '*' when credentials are enabled")
+    return origins
+
+
 # Allow requests from the Next.js frontend.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-    ],
+    allow_origins=get_cors_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
